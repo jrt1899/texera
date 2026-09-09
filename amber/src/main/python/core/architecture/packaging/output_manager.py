@@ -40,6 +40,7 @@ from core.architecture.sendsemantics.range_based_shuffle_partitioner import (
 )
 from core.architecture.sendsemantics.round_robin_partitioner import (
     RoundRobinPartitioner,
+    _ROUTING_PREF_BASE,
 )
 from core.models import Tuple, Schema, StateFrame
 from core.models.payload import DataPayload, DataFrame
@@ -279,6 +280,18 @@ class OutputManager:
         """
         the_partitioning = get_one_of(partitioning)
         logger.debug(f"adding {the_partitioning}")
+
+        # A negative batch size is not a size at all: batch_size <=
+        # _ROUTING_PREF_BASE is a least-loaded-routing signal, carried on this
+        # existing call rather than a new RPC (which would mean regenerating
+        # protobuf for both Scala and Python). The partitioning itself is left
+        # untouched.
+        if the_partitioning.batch_size is not None and the_partitioning.batch_size <= _ROUTING_PREF_BASE:
+            existing = self._partitioners.get(tag)
+            if existing is not None and hasattr(existing, "set_preferred_receiver_index"):
+                existing.set_preferred_receiver_index(_ROUTING_PREF_BASE - the_partitioning.batch_size)
+            return
+
         for channel_id in the_partitioning.channels:
             if channel_id.from_worker_id.name == self.worker_id:
                 # Explicitly set is_control to trigger lazy computation.
@@ -287,10 +300,13 @@ class OutputManager:
                 channel_id.is_control = False
                 self._channels[channel_id] = Channel()
         partitioner = self._partitioning_to_partitioner[type(the_partitioning)]
+        # Round-robin also takes the worker id: in batch-level mode it seeds
+        # the rotation from the sender's index so senders do not all start on
+        # the same receiver (see round_robin_partitioner.py).
         self._partitioners[tag] = (
-            partitioner(the_partitioning)
-            if partitioner != OneToOnePartitioner
-            else partitioner(the_partitioning, self.worker_id)
+            partitioner(the_partitioning, self.worker_id)
+            if partitioner in (OneToOnePartitioner, RoundRobinPartitioner)
+            else partitioner(the_partitioning)
         )
 
     def tuple_to_batch(

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os as _os
 from collections import defaultdict
 from typing import DefaultDict
 
@@ -26,6 +27,21 @@ from proto.org.apache.texera.amber.engine.architecture.worker import (
     PortTupleMetricsMapping,
     TupleMetrics,
 )
+
+# Least-loaded routing: a receiver's true backlog is "tuples delivered -
+# tuples processed", not just "tuples processed" (all of _input_tuple_metrics
+# below reports). There is no protobuf field for "delivered" -- adding one
+# needs protoc/betterproto regeneration for both Scala and Python, unavailable
+# in this environment -- so the count is carried inside input_tuple_metrics
+# itself, tagged with a reserved PortIdentity that can never collide with a
+# real port (real ports are always non-negative). The controller strips this
+# entry out before it reaches anything UI-facing; see
+# QueryWorkerStatisticsHandler.scala.
+RECEIVED_COUNT_SENTINEL_PORT = PortIdentity(id=-1, internal=True)
+
+_LEAST_LOADED_ROUTING = _os.environ.get(
+    "TEXERA_LEAST_LOADED_ROUTING", ""
+).strip().lower() in ("1", "true")
 
 
 class StatisticsManager:
@@ -41,14 +57,32 @@ class StatisticsManager:
         self._control_processing_time: int = 0
         self._total_execution_time: int = 0
         self._worker_start_time: int = 0
+        # Tuples handed to this worker's processing loop, counted at arrival --
+        # before they are unpacked into individual Tuples and processed one by
+        # one. Deliberately separate from _input_tuple_metrics, which only
+        # grows once a tuple is actually consumed.
+        self._received_count: int = 0
+
+    def increase_received_statistics(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("Received count must be non-negative")
+        self._received_count += count
 
     def get_statistics(self) -> WorkerStatistics:
         # Compile and return worker statistics
+        input_metrics = [
+            PortTupleMetricsMapping(port_id, TupleMetrics(*tuple_metrics))
+            for port_id, tuple_metrics in self._input_tuple_metrics.items()
+        ]
+        if _LEAST_LOADED_ROUTING:
+            input_metrics.append(
+                PortTupleMetricsMapping(
+                    RECEIVED_COUNT_SENTINEL_PORT,
+                    TupleMetrics(self._received_count, 0),
+                )
+            )
         return WorkerStatistics(
-            [
-                PortTupleMetricsMapping(port_id, TupleMetrics(*tuple_metrics))
-                for port_id, tuple_metrics in self._input_tuple_metrics.items()
-            ],
+            input_metrics,
             [
                 PortTupleMetricsMapping(port_id, TupleMetrics(*tuple_metrics))
                 for port_id, tuple_metrics in self._output_tuple_metrics.items()

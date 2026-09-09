@@ -785,6 +785,17 @@ class MainLoop(StoppableQueueBlockingRunnable):
         if self.context.state_manager.confirm_state(WorkerState.READY):
             self.context.state_manager.transit_to(WorkerState.RUNNING)
 
+        # Least-loaded routing: count tuples the instant they arrive, before
+        # they are unpacked and processed one by one -- this is "received",
+        # distinct from statistics_manager's existing "processed" count.
+        # Only DataFrame carries real tuples (StateFrame does not).
+        from core.models.payload import DataFrame as _DataFrame
+
+        if isinstance(data_element.payload, _DataFrame):
+            self.context.statistics_manager.increase_received_statistics(
+                data_element.payload.frame.num_rows
+            )
+
         self.context.tuple_processing_manager.current_input_tuple_iter = (
             self.context.input_manager.process_data_payload(
                 data_element.tag, data_element.payload

@@ -21,14 +21,17 @@ package org.apache.texera.amber.engine.architecture.coordinator.promisehandlers
 
 import com.twitter.util.Future
 import org.apache.texera.common.config.ApplicationConfig
-import org.apache.texera.amber.core.virtualidentity.PhysicalOpIdentity
+import org.apache.texera.amber.core.virtualidentity.{ActorVirtualIdentity, PhysicalOpIdentity}
+import org.apache.texera.amber.core.workflow.{PhysicalLink, PortIdentity}
 import org.apache.texera.amber.engine.architecture.coordinator.{
   CoordinatorAsyncRPCHandlerInitializer,
   ExecutionStatsUpdate,
+  LeastLoadedRoutingService,
   RuntimeStatisticsPersist
 }
 import org.apache.texera.amber.engine.architecture.deploysemantics.layer.WorkerExecution
 import org.apache.texera.amber.engine.architecture.rpc.controlcommands.{
+  AddPartitioningRequest,
   AsyncRPCContext,
   EmptyRequest,
   QueryStatisticsRequest,
@@ -39,9 +42,18 @@ import org.apache.texera.amber.engine.architecture.rpc.controlreturns.{
   EmptyReturn,
   WorkerMetricsResponse
 }
+import org.apache.texera.amber.engine.architecture.scheduling.config.LeastLoadedRoutingConfig
+import org.apache.texera.amber.engine.architecture.sendsemantics.partitionings.RoundRobinPartitioning
+import org.apache.texera.amber.engine.architecture.worker.statistics.WorkerStatistics
 import org.apache.texera.amber.util.VirtualIdentityUtils
 
-/** Get statistics from all the workers
+/** Get statistics from all the workers, and (when TEXERA_LEAST_LOADED_ROUTING
+  * is on) use them to steer batch-level round-robin senders toward whichever
+  * receiver currently has the least queued work.
+  *
+  * Everything above the "--- least-loaded routing ---" marker below is
+  * unmodified stock Texera (as of the `main` branch this was built against).
+  * Everything below the marker is the addition.
   *
   * possible sender: coordinator(by statusUpdateAskHandle)
   */
@@ -76,6 +88,116 @@ trait QueryWorkerStatisticsHandler {
         sendToClient(RuntimeStatisticsPersist(stats))
     }
   }
+
+  // --- least-loaded routing ------------------------------------------------
+  //
+  // A receiver's true backlog is "tuples delivered - tuples processed", not
+  // just "tuples processed" (all WorkerStatistics.inputTupleMetrics normally
+  // reports). There is no protobuf field for "delivered" -- adding one needs
+  // protoc/betterproto regeneration for both Scala and Python, unavailable in
+  // this environment -- so the count is carried inside inputTupleMetrics
+  // itself, tagged with a reserved PortIdentity that can never collide with a
+  // real port (real ports are always non-negative). See
+  // core/architecture/managers/statistics_manager.py for where it is written.
+  private val RECEIVED_COUNT_SENTINEL_PORT = PortIdentity(-1, internal = true)
+
+  // Mirrors _ROUTING_PREF_BASE in round_robin_partitioner.py exactly.
+  // batch_size <= ROUTING_PREF_BASE, sent on the ordinary AddPartitioning RPC,
+  // encodes "prefer the receiver at this index" as (ROUTING_PREF_BASE -
+  // batch_size) rather than a real batch size. No new RPC and no protobuf
+  // change: the field already exists and a size can never legitimately be
+  // negative, so this range was free to repurpose.
+  private val ROUTING_PREF_BASE = -1000
+
+  /** Strips the sentinel entry out of a worker's raw statistics before they
+    * reach anything else -- collectedResults feeds wExec.updateStats, which
+    * feeds the dashboard via getAllRegionExecutionsStats. Left in place, it
+    * would show up as a fake port in the operator's real per-port statistics.
+    * Returns the cleaned stats and the extracted count separately.
+    */
+  private def extractReceivedCount(stats: WorkerStatistics): (WorkerStatistics, Option[Long]) = {
+    val (sentinelEntries, realEntries) =
+      stats.inputTupleMetrics.partition(_.portId == RECEIVED_COUNT_SENTINEL_PORT)
+    if (sentinelEntries.isEmpty) {
+      (stats, None)
+    } else {
+      (stats.copy(inputTupleMetrics = realEntries), Some(sentinelEntries.map(_.tupleMetrics.count).sum))
+    }
+  }
+
+  /** Round-robin links in the executing regions, with the partitioning each
+    * was configured with -- the same source the link-wiring handler used to
+    * wire them, so this sees exactly what the workers were actually told.
+    */
+  private def liveRoundRobinLinks: Map[PhysicalLink, RoundRobinPartitioning] = {
+    cp.workflowExecutionManager.getExecutingRegions.toSeq
+      .flatMap(_.resourceConfig.toSeq)
+      .flatMap(_.linkConfigs.toSeq)
+      .collect {
+        case (link, linkConfig) =>
+          linkConfig.partitioning match {
+            case rr: RoundRobinPartitioning => Some(link -> rr)
+            case _                          => None
+          }
+      }
+      .flatten
+      .toMap
+  }
+
+  /**
+    * Assign each sender on a live batch-level round-robin link a preferred
+    * receiver, ranked by measured backlog (delivered - processed), instead of
+    * the fixed rotation it would otherwise use.
+    *
+    * A no-op for any sender not actually running in batch-level mode: the
+    * signal only has an effect where RoundRobinPartitioner.set_preferred_
+    * receiver_index is read on the Python side, gated there on
+    * TEXERA_BATCH_LEVEL_RR. Safe to send broadly rather than track which mode
+    * each sender is in.
+    */
+  private def runLeastLoadedRouting(
+      samples: Seq[(ActorVirtualIdentity, WorkerStatistics)],
+      receivedCounts: Map[ActorVirtualIdentity, Long]
+  ): Unit = {
+    val links = liveRoundRobinLinks
+    if (links.isEmpty) return
+
+    // Per-WORKER processed count, deliberately not aggregated across an
+    // operator's workers: the whole point is telling individual receivers
+    // apart, which an operator-level sum would erase.
+    val processedByWorker: Map[ActorVirtualIdentity, Long] = samples.map {
+      case (wid, stats) => wid -> stats.inputTupleMetrics.map(_.tupleMetrics.count).sum
+    }.toMap
+
+    links.foreach {
+      case (link, partitioning) =>
+        val senders = partitioning.channels.map(_.fromWorkerId).distinct
+        val receivers = partitioning.channels.map(_.toWorkerId).distinct
+        val backlogByReceiver: Map[ActorVirtualIdentity, Long] = receivers.map { r =>
+          val delivered = receivedCounts.getOrElse(r, 0L)
+          val processed = processedByWorker.getOrElse(r, 0L)
+          r -> math.max(0L, delivered - processed)
+        }.toMap
+
+        val assignments =
+          LeastLoadedRoutingService.computeAssignments(senders, receivers, backlogByReceiver)
+
+        assignments.foreach { a =>
+          val index = receivers.indexOf(a.preferredReceiver)
+          if (index >= 0) {
+            val signal = partitioning.withBatchSize(ROUTING_PREF_BASE - index)
+            workerInterface.addPartitioning(AddPartitioningRequest(link, signal), mkContext(a.sender))
+            if (LeastLoadedRoutingConfig.verbose) {
+              logger.info(
+                s"[least-loaded-routing] ${a.sender.name} -> prefer ${a.preferredReceiver.name} " +
+                  s"(backlog=${backlogByReceiver.getOrElse(a.preferredReceiver, 0L)})"
+              )
+            }
+          }
+        }
+    }
+  }
+  // --- end least-loaded routing ---------------------------------------------
 
   override def coordinatorInitiateQueryStatistics(
       msg: QueryStatisticsRequest,
@@ -129,6 +251,11 @@ trait QueryWorkerStatisticsHandler {
     val collectedResults =
       scala.collection.mutable.ArrayBuffer.empty[(WorkerExecution, WorkerMetricsResponse, Long)]
 
+    // Same replies, cleaned of the sentinel, for least-loaded routing.
+    val receiverSamples =
+      scala.collection.mutable.ArrayBuffer.empty[(ActorVirtualIdentity, WorkerStatistics)]
+    val receivedCounts = scala.collection.mutable.HashMap.empty[ActorVirtualIdentity, Long]
+
     // Recursively process each operator layer sequentially (top-down in reverse topo order)
     def processLayers(layers: Seq[Set[PhysicalOpIdentity]]): Future[Unit] =
       layers match {
@@ -157,9 +284,27 @@ trait QueryWorkerStatisticsHandler {
                     // Send queryStatistics to each worker and update internal state on reply
                     workerIds.map { wid =>
                       workerInterface.queryStatistics(EmptyRequest(), wid).map { resp =>
+                        // Strip the sentinel (if present) before this reply
+                        // reaches anything else: collectedResults feeds the
+                        // dashboard, and it must never see it.
+                        val (cleanedStats, receivedCount) =
+                          extractReceivedCount(resp.metrics.workerStatistics)
+                        val cleanedResp =
+                          if (receivedCount.isDefined)
+                            resp.copy(metrics = resp.metrics.copy(workerStatistics = cleanedStats))
+                          else resp
+                        receivedCount.foreach(c => receivedCounts.update(wid, c))
+
                         collectedResults.addOne(
-                          (exec.getWorkerExecution(wid), resp, System.nanoTime())
+                          (exec.getWorkerExecution(wid), cleanedResp, System.nanoTime())
                         )
+                        // Full-graph rounds only. A filtered round covers a
+                        // subset of workers; folding a partial view into the
+                        // ranking would read an un-polled receiver's silence
+                        // as "no backlog" instead of "no data this round".
+                        if (LeastLoadedRoutingConfig.enabled && msg.filterByWorkers.isEmpty) {
+                          receiverSamples.addOne((wid, cleanedStats))
+                        }
                       }
                     }
                   }
@@ -180,6 +325,15 @@ trait QueryWorkerStatisticsHandler {
           wExec.updateStats(timestamp, resp.metrics.workerStatistics)
       }
       forwardStats(msg.updateTarget)
+      if (LeastLoadedRoutingConfig.enabled && msg.filterByWorkers.isEmpty) {
+        // Statistics reporting must not depend on this: run it after the
+        // stats have been forwarded, and never let it escape -- an exception
+        // here must not freeze globalQueryStatsOngoing at true.
+        try runLeastLoadedRouting(receiverSamples.toSeq, receivedCounts.toMap)
+        catch {
+          case t: Throwable => logger.warn(s"[least-loaded-routing] round failed: $t")
+        }
+      }
       // Record the completion timestamp before releasing the lock so that any timer
       // firing in between sees a valid cache entry rather than triggering a redundant query.
       if (globalQueryStatsOngoing) {
